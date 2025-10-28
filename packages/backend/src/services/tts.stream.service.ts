@@ -100,20 +100,45 @@ async function generateWithLLMStream(task: Task) {
         ...segment,
         voice: segment.name,
       }))
+
+  // 添加降级策略：如果LLM连续失败，使用默认的Edge TTS
+  const fallbackToEdgeTTS = (error: Error) => {
+    logger.error('LLM processing failed, falling back to Edge TTS', { error: error.message })
+    logger.info('Using default voice for Edge TTS fallback')
+    // 使用第一个可用的voice作为默认
+    const defaultVoice = voiceList[0]?.Name || 'zh-CN-XiaoxiaoNeural'
+    const params = {
+      text,
+      voice: defaultVoice,
+      pitch: '+0Hz',
+      rate: '+0%',
+      volume: '+0%',
+      output: id,
+    } as TTSParams
+    logger.info(`Fallback params: ${JSON.stringify(params)}`)
+    return generateWithoutLLMStream(params, task)
+  }
+
   if (length <= 1) {
-    const prompt = getPrompt(lang, voiceList, segments[0])
-    logger.debug(`Prompt for LLM: ${prompt}`)
-    const llmResponse = await fetchLLMSegment(prompt)
-    let llmSegments = llmResponse?.result || llmResponse?.segments || []
-    if (!Array.isArray(llmSegments)) {
-      throw new Error(
-        'LLM response is not an array, please switch to Edge TTS mode or use another model'
-      )
+    try {
+      const prompt = getPrompt(lang, voiceList, segments[0])
+      logger.debug(`Prompt for LLM: ${prompt}`)
+      const llmResponse = await fetchLLMSegment(prompt)
+      let llmSegments = llmResponse?.result || llmResponse?.segments || []
+      if (!Array.isArray(llmSegments)) {
+        throw new Error(
+          'LLM response is not an array, please switch to Edge TTS mode or use another model'
+        )
+      }
+      buildSegmentList(formatLlmSegments(llmSegments), task)
+    } catch (error) {
+      fallbackToEdgeTTS(error as Error)
     }
-    buildSegmentList(formatLlmSegments(llmSegments), task)
   } else {
     const output = resolve(AUDIO_DIR, id)
     let count = 0
+    let consecutiveFailures = 0
+    const maxConsecutiveFailures = 3 // 连续失败3次后降级
     logger.info('Splitting text into multiple segments:', segments.length)
     const getProgress = () => {
       return Number(((count / segments.length) * 100).toFixed(2))
@@ -123,34 +148,101 @@ async function generateWithLLMStream(task: Task) {
     outputStream.pipe(res)
     outputStream.pipe(localStream)
 
-    for (let seg of segments) {
-      count++
-      const prompt = getPrompt(lang, voiceList, seg)
-      logger.debug(`Prompt for LLM: ${prompt}`)
-      const llmResponse = await fetchLLMSegment(prompt)
-      let llmSegments = llmResponse?.result || llmResponse?.segments || []
-      if (!Array.isArray(llmSegments)) {
-        throw new Error(
-          'LLM response is not an array, please switch to Edge TTS mode or use another model'
-        )
+    try {
+      for (let seg of segments) {
+        count++
+        try {
+          const prompt = getPrompt(lang, voiceList, seg)
+          logger.debug(`Prompt for LLM: ${prompt}`)
+          const llmResponse = await fetchLLMSegment(prompt)
+          let llmSegments = llmResponse?.result || llmResponse?.segments || []
+          if (!Array.isArray(llmSegments)) {
+            throw new Error(
+              'LLM response is not an array, please switch to Edge TTS mode or use another model'
+            )
+          }
+          // 成功后重置失败计数
+          consecutiveFailures = 0
+
+          for (let segment of formatLlmSegments(llmSegments)) {
+            logger.info(`Processing segment: ${segment.text?.slice(0, 20)}...`)
+            try {
+              const stream = (await generateSingleVoiceStream({
+                ...segment,
+                output,
+                outputType: 'stream',
+              })) as Readable
+              stream.pipe(outputStream, { end: false })
+              await new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => {
+                  stream.destroy()
+                  reject(new Error('Stream timeout: no data received within 60s'))
+                }, 60000)
+
+                stream.on('end', () => {
+                  clearTimeout(timeout)
+                  logger.debug(`Segment stream ended: ${segment.text?.slice(0, 20)}...`)
+                  resolve(null)
+                })
+                stream.on('error', (err) => {
+                  clearTimeout(timeout)
+                  logger.error(`Segment stream error: ${err.message}`)
+                  reject(err)
+                })
+              })
+            } catch (err) {
+              logger.error(`Failed to process segment after retries: ${(err as Error).message}`)
+              throw err
+            }
+          }
+          logger.info(`Progress: ${getProgress()}%`)
+        } catch (err) {
+          consecutiveFailures++
+          logger.error(`LLM segment processing failed (${consecutiveFailures}/${maxConsecutiveFailures})`, {
+            error: (err as Error).message,
+            segment: seg.slice(0, 50)
+          })
+
+          if (consecutiveFailures >= maxConsecutiveFailures) {
+            logger.error('Too many consecutive LLM failures, falling back to Edge TTS for remaining segments')
+            // 关闭当前流
+            outputStream.end()
+            localStream.end()
+            // 使用降级策略处理剩余文本
+            const remainingText = segments.slice(count - 1).join('\n')
+            return fallbackToEdgeTTS(new Error(`LLM failed ${consecutiveFailures} times consecutively`))
+          }
+
+          // 如果还没达到降级阈值，使用默认voice处理这个segment
+          logger.info('Using default voice for failed segment')
+          const defaultVoice = voiceList[0]?.Name || 'zh-CN-XiaoxiaoNeural'
+          const stream = (await generateSingleVoiceStream({
+            text: seg,
+            voice: defaultVoice,
+            pitch: '+0Hz',
+            rate: '+0%',
+            volume: '+0%',
+            output,
+            outputType: 'stream',
+          })) as Readable
+          stream.pipe(outputStream, { end: false })
+          await new Promise((resolve, reject) => {
+            stream.on('end', resolve)
+            stream.on('error', reject)
+          })
+          logger.info(`Progress: ${getProgress()}%`)
+        }
       }
-      for (let segment of formatLlmSegments(llmSegments)) {
-        const stream = (await generateSingleVoiceStream({
-          ...segment,
-          output,
-          outputType: 'stream',
-        })) as Readable
-        stream.pipe(outputStream, { end: false })
-        await new Promise((resolve) => {
-          stream.on('end', resolve)
-        })
-      }
-      logger.info(`Progress: ${getProgress()}%`)
+      outputStream.end()
+      setTimeout(() => {
+        handleSrt(output)
+      }, 200)
+    } catch (err) {
+      logger.error('Fatal error in LLM stream processing', { error: (err as Error).message })
+      outputStream.destroy()
+      localStream.destroy()
+      throw err
     }
-    outputStream.end()
-    setTimeout(() => {
-      handleSrt(output)
-    }, 200)
   }
 }
 const buildFinal = async (finalSegments: TTSResult[], id: string) => {
@@ -365,26 +457,81 @@ function validateLangAndVoice(lang: string, voice: string, res: Response): boole
 }
 
 /**
- * 从 LLM 获取分段参数
+ * 从 LLM 获取分段参数（带重试机制）
+ * 注意：openai.createChatCompletion 内部已经有 5 次重试，这里增加额外的应用层重试
  */
-async function fetchLLMSegment(prompt: string): Promise<any> {
-  const response = await openai.createChatCompletion({
-    messages: [
-      {
-        role: 'system',
-        content: 'You are a helpful assistant. And you can return valid json object',
-      },
-      { role: 'user', content: prompt },
-    ],
-    // temperature: 0.7,
-    // max_tokens: 500,
-    response_format: { type: 'json_object' },
-  })
+async function fetchLLMSegment(prompt: string, retries = 3): Promise<any> {
+  let lastError: Error | null = null
 
-  if (!response.choices[0].message.content) {
-    throw new Error(ErrorMessages.INVALID_API_RESPONSE)
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      logger.debug(`LLM API request started (attempt ${attempt}/${retries})`)
+      logger.debug(`Prompt length: ${prompt.length} characters`)
+
+      const response = await openai.createChatCompletion({
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a helpful assistant. And you can return valid json object',
+          },
+          { role: 'user', content: prompt },
+        ],
+        // temperature: 0.7,
+        // max_tokens: 500,
+        response_format: { type: 'json_object' },
+      })
+
+      // 验证响应结构
+      if (!response || typeof response !== 'object') {
+        logger.error('Invalid response type', {
+          responseType: typeof response,
+          response: JSON.stringify(response).slice(0, 200)
+        })
+        throw new Error('Invalid response type')
+      }
+
+      if (!response.choices || response.choices.length === 0) {
+        logger.error('Empty or missing choices array', {
+          response: JSON.stringify(response).slice(0, 500)
+        })
+        throw new Error('Empty or missing choices array')
+      }
+
+      if (!response.choices[0].message?.content) {
+        logger.error('Empty message content', {
+          message: JSON.stringify(response.choices[0].message).slice(0, 200),
+          fullResponse: JSON.stringify(response).slice(0, 1000)
+        })
+        throw new Error('Empty message content')
+      }
+
+      logger.debug('LLM response received successfully', {
+        contentLength: response.choices[0].message.content.length,
+        contentPreview: response.choices[0].message.content.slice(0, 150)
+      })
+
+      return parseLLMResponse(response)
+    } catch (err) {
+      lastError = err as Error
+      logger.error(`LLM API request failed (attempt ${attempt}/${retries})`, {
+        error: lastError.message,
+        stack: lastError.stack?.split('\n').slice(0, 3).join('\n')
+      })
+
+      // 如果还有重试机会，等待后重试
+      if (attempt < retries) {
+        const delay = Math.min(2000 * Math.pow(2, attempt - 1), 10000) // 指数退避
+        logger.info(`Retrying LLM request in ${delay}ms...`)
+        await asyncSleep(delay)
+        continue
+      }
+
+      // 最后一次失败，抛出错误
+      throw new Error(`${ErrorMessages.INVALID_API_RESPONSE}: ${lastError.message}`)
+    }
   }
-  return parseLLMResponse(response)
+
+  throw new Error(`${ErrorMessages.INVALID_API_RESPONSE}: ${lastError?.message || 'Unknown error'}`)
 }
 
 /**

@@ -225,7 +225,7 @@ class EdgeTTS {
     }
 
     // 设置超时
-    const timeout = setTimeout(() => {
+    let timeout = setTimeout(() => {
       _wsConnect.close()
       if (readableStream) readableStream.destroy(new Error('WebSocket timed out'))
       if (outputType === 'file') {
@@ -237,7 +237,17 @@ class EdgeTTS {
 
     // 处理 WebSocket 消息
     _wsConnect.on('message', (data: Buffer, isBinary: boolean) => {
+      // 每次收到消息都重置超时
       clearTimeout(timeout)
+      timeout = setTimeout(() => {
+        _wsConnect.close()
+        if (readableStream) readableStream.destroy(new Error('WebSocket timed out'))
+        if (outputType === 'file') {
+          audioStream?.end()
+          rejectFile?.(new Error('WebSocket timed out'))
+        }
+        if (outputType === 'buffer') rejectBuffer?.(new Error('WebSocket timed out'))
+      }, this.timeout)
       if (isBinary) {
         const separator = 'Path:audio\r\n'
         const index = data.indexOf(separator) + separator.length
@@ -315,6 +325,12 @@ class EdgeTTS {
         if (outputType === 'stream' && !isStreamDestroyed)
           readableStream?.destroy(new Error(errMsg))
         if (outputType === 'buffer') rejectBuffer?.(new Error(errMsg))
+      } else {
+        // 正常关闭但没有收到 turn.end，确保流被正确关闭
+        if (outputType === 'stream' && readableStream && !isStreamDestroyed && !readableStream.readableEnded) {
+          console.log('WebSocket closed normally but stream not ended, pushing null to end stream')
+          readableStream.push(null)
+        }
       }
     })
 

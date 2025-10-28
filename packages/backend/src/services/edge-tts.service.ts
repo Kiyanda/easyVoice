@@ -21,7 +21,7 @@ export async function runEdgeTTS({
     pitch,
     rate,
     volume,
-    timeout: 30_000,
+    timeout: 60_000,
   })
   console.log(`run with nodejs edge-tts service...`)
   if (outputType === 'file') {
@@ -52,7 +52,14 @@ export const generateSingleVoice = async (
 export const generateSingleVoiceStream = async (
   params: Omit<EdgeSchema, 'useLLM'> & { output: string; outputType?: string }
 ) => {
-  return runEdgeTTS({ ...params, outputType: 'stream' })
+  let result: any
+  await safeRunWithRetry(
+    async () => {
+      result = await runEdgeTTS({ ...params, outputType: 'stream' })
+    },
+    { retries: 3, baseDelayMs: 1000 }
+  )
+  return result
 }
 
 // 定义字幕数据的类型

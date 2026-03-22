@@ -11,7 +11,12 @@ TAG=$1
 
 REPO="cosincox/easyvoice"
 
-sudo docker buildx create --name multiarch-builder --use || true
+# 创建或使用现有的多架构构建器
+if ! docker buildx inspect multiarch-builder >/dev/null 2>&1; then
+  sudo docker buildx create --name multiarch-builder --driver docker-container --use
+else
+  sudo docker buildx use multiarch-builder
+fi
 sudo docker buildx inspect --bootstrap
 
 sudo docker buildx build \
